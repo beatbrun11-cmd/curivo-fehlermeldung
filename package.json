@@ -1,0 +1,23 @@
+{
+  "name": "@curivo/fehlermeldung",
+  "version": "1.0.0",
+  "description": "Meldet Fehler an Sentry: nur Modul, Route und Fehlercode aus geschlossenen Listen, nie Personendaten.",
+  "license": "UNLICENSED",
+  "private": false,
+  "type": "commonjs",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepare": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
+  }
+}
