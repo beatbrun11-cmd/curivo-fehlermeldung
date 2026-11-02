@@ -1,7 +1,7 @@
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { erstelleMelder, leseDsn, type Einstellungen } from "../index";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { erstelleMelder, leseDsn, pauseMs, type Einstellungen } from "../index";
 
 const KEY = "0123456789abcdef0123456789abcdef";
 const SHA = "a1b2c3d";
@@ -9,7 +9,7 @@ const ROUTEN = ["/api/klienten/[id]", "/intern/fehlerprobe"];
 /** Was in keinem Fall bei Sentry ankommen darf. */
 const MARKER = ["Muster Anna", "756.1234.5678.97", "anna@example.ch", "?klient=42", "Diagnose: Diabetes"];
 
-type Antwort = { status: number; headers?: Record<string, string>; haengen?: boolean };
+type Antwort = { status: number; headers?: Record<string, string>; haengen?: boolean; verzoegerung?: number };
 let server: Server;
 let basis: string;
 let empfangen: { pfad: string; headers: IncomingHttpHeaders; body: string }[] = [];
@@ -23,7 +23,7 @@ beforeAll(async () => {
       empfangen.push({ pfad: req.url!, headers: req.headers, body });
       const a = antwortFuer(req.url!);
       if (a.haengen) return;
-      res.writeHead(a.status, a.headers).end();
+      setTimeout(() => res.writeHead(a.status, a.headers).end(), a.verzoegerung ?? 0);
     });
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
@@ -63,17 +63,22 @@ describe("Envelope", () => {
     expect(empfangen).toHaveLength(1);
     const { pfad, headers, body } = empfangen[0];
     expect(pfad).toBe("/api/1/envelope/");
-    expect(headers["x-sentry-auth"]).toContain(`sentry_key=${KEY}`);
+    expect(headers["x-sentry-auth"]).toBe(`Sentry sentry_version=7, sentry_key=${KEY}, sentry_client=curivo-fehlermeldung/1.0.0`);
     expect(headers["content-type"]).toBe("application/x-sentry-envelope");
     const [kopf, item, ereignis, ...rest] = zeilen(body);
     expect(rest).toHaveLength(0);
     expect(Object.keys(kopf).sort()).toEqual(["dsn", "event_id", "sent_at"]);
+    expect(kopf.event_id).toBe(diagnoseId);
+    expect(kopf.dsn).toBe(`${basis}/1`);
     expect(item).toEqual({ type: "event" });
     expect(Object.keys(ereignis).sort()).toEqual(
       ["environment", "event_id", "fingerprint", "level", "message", "platform", "release", "tags", "timestamp"],
     );
-    expect(ereignis).toMatchObject({
+    expect(ereignis).toEqual({
       event_id: diagnoseId,
+      timestamp: expect.any(Number),
+      platform: "other",
+      level: "error",
       release: SHA,
       environment: "produktion",
       message: "log antwort_5xx /api/klienten/[id]",
@@ -84,6 +89,30 @@ describe("Envelope", () => {
 });
 
 describe("Personendaten", () => {
+  const vergiftet = (m: ReturnType<typeof melder>, x: string) =>
+    m.melde({ route: x, code: x, status: x as never, quelle: x as never }).fertig;
+
+  it("Negativkontrolle: ohne Prüfung findet die Suche jeden Marker in jedem Feld (P8)", async () => {
+    const identitaet = { modul: (x: unknown) => x, environment: (x: unknown) => x, release: (x: unknown) => x,
+      route: (_: unknown, x: unknown) => x, code: (x: unknown) => x, status: (x: unknown) => x, quelle: () => "server" } as never;
+    for (const x of MARKER) await vergiftet(melder({ pruefer: identitaet, modul: x as never, release: x, environment: x }), x);
+    MARKER.forEach((x, i) => {
+      const e = zeilen(empfangen[i].body)[2];
+      for (const wert of [e.release, e.environment, e.tags.modul, e.tags.route, e.tags.code, e.tags.status]) expect(wert).toBe(x);
+    });
+  });
+
+  it("DSN mit Anhang oder Abfrage wird abgewiesen, nichts davon reist mit", () => {
+    expect(leseDsn(`${basis}/1#Diagnose: Diabetes`, true)).toBeNull();
+    expect(leseDsn(`${basis}/1?name=Muster`, true)).toBeNull();
+  });
+
+  it("ein Objekt als Release kommt nicht durch, auch wenn es sich als SHA ausgibt", async () => {
+    const falsch = { toString: () => SHA, toJSON: () => "Diagnose: Diabetes" };
+    await melder({ release: falsch as never }).melde({ route: "/intern/fehlerprobe", code: "unbehandelt" }).fertig;
+    expect(zeilen(empfangen[0].body)[2].release).toBe("unbekannt");
+  });
+
   it("vergiftete Eingaben erreichen Sentry nicht", async () => {
     for (const x of MARKER) {
       const m = melder({ release: x, environment: x });
@@ -98,10 +127,6 @@ describe("Personendaten", () => {
     expect(e.environment).toBe("unbekannt");
   });
 
-  it("Positivkontrolle: steht der Marker in der vertrauten Routenliste, findet die Suche ihn", async () => {
-    for (const x of MARKER) await melder({ routen: [x] }).melde({ route: x, code: "unbehandelt" }).fertig;
-    MARKER.forEach((x, i) => expect(empfangen[i].body).toContain(JSON.stringify(x).slice(1, -1)));
-  });
 });
 
 describe("Ziel", () => {
@@ -229,5 +254,118 @@ describe("Mengen", () => {
     m.melde({ route: "/intern/fehlerprobe", code: "start_fehler" });
     await m.spuele(2_000);
     expect(empfangen).toHaveLength(2);
+  });
+});
+
+describe("Wirft nie", () => {
+  it("kaputtes Log, kaputter Transport und giftige Meldung reissen die App nicht mit", async () => {
+    const abgelehnt: unknown[] = [];
+    const merke = (g: unknown) => abgelehnt.push(g);
+    process.on("unhandledRejection", merke);
+    try {
+      const m = melder({
+        protokoll: () => { throw new Error("log kaputt"); },
+        fetch: (() => { throw new Error("synchron kaputt"); }) as never,
+      });
+      expect(await m.melde({ route: "/intern/fehlerprobe", code: "unbehandelt" }).fertig).toBe("fehler");
+      const gift = { get route(): string { throw new Error("getter"); }, code: "unbehandelt" };
+      expect(await m.melde(gift).fertig).toBe("fehler");
+      expect(await melder({ protokoll: () => { throw new Error("log kaputt"); } }).melde({ route: "/intern/fehlerprobe", code: "unbehandelt" }).fertig).toBe("gesendet");
+      await new Promise((r) => setTimeout(r, 20));
+      expect(abgelehnt).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", merke);
+    }
+  });
+});
+
+describe("Zusammenfassungen", () => {
+  it("zählen ins Minutenbudget; was keinen Platz hat, bleibt im Korb", async () => {
+    let t = 7_200_000;
+    const m = melder({ jetzt: () => t, routen: Array.from({ length: 40 }, (_, i) => `/r${i}`) });
+    for (let i = 0; i < 30; i++) await m.melde({ route: `/r${i}`, code: "unbehandelt" }).fertig;
+    for (let i = 0; i < 5; i++) m.melde({ route: `/r${i}`, code: "unbehandelt" });
+    expect(m.fasseZusammen()).toHaveLength(0);
+    expect(empfangen).toHaveLength(30);
+    t += 60_000;
+    await Promise.all(m.fasseZusammen());
+    expect(empfangen).toHaveLength(35);
+  });
+
+  it("nicht zugestellte Zusammenfassung geht zurück in den Korb", async () => {
+    let t = 7_200_000;
+    let status = 500;
+    antwortFuer = () => ({ status });
+    const m = melder({ jetzt: () => t });
+    for (let i = 0; i < 12; i++, t += 100) m.melde({ route: "/api/klienten/[id]", code: "unbehandelt" });
+    expect(await Promise.all(m.fasseZusammen())).toEqual(["fehler"]);
+    status = 200;
+    t += 60_000;
+    await Promise.all(m.fasseZusammen());
+    const z = zeilen(empfangen.at(-1)!.body)[2];
+    expect(z.fingerprint[3]).toBe("haeufung");
+    expect(z.tags.wiederholt).toBe("10-99");
+  });
+
+  it("gestrige Häufung wird heute nicht gemeldet (Abnahme d)", async () => {
+    let t = Date.UTC(2026, 10, 1, 14);
+    const m = melder({ jetzt: () => t });
+    for (let i = 0; i < 20; i++, t += 100) m.melde({ route: "/api/klienten/[id]", code: "unbehandelt" });
+    await new Promise((r) => setTimeout(r, 20));
+    t = Date.UTC(2026, 10, 2, 9);
+    expect(m.fasseZusammen()).toHaveLength(0);
+    expect(empfangen).toHaveLength(1);
+  });
+
+  it("der Takt stellt nach einer Minute Ruhe von selbst zu", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval"] });
+    try {
+      let t = 0;
+      const m = erstelleMelder({ modul: "log", dsn: { server: `${basis}/1` }, release: SHA, environment: "produktion",
+        routen: ROUTEN, testmodus: true, aus: () => false, protokoll: () => {}, jetzt: () => t });
+      for (let i = 0; i < 3; i++, t += 100) m.melde({ route: "/api/klienten/[id]", code: "unbehandelt" });
+      t += 60_000;
+      vi.advanceTimersByTime(60_000);
+      await new Promise((r) => setTimeout(r, 200));
+      m.stoppe();
+      expect(empfangen).toHaveLength(2);
+      expect(zeilen(empfangen[1].body)[2].tags.wiederholt).toBe("1-9");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("Pause", () => {
+  it("X-Sentry-Rate-Limits gilt auch bei 200, nur für Ereignis-Kategorien, und verlängert nur", () => {
+    const a = (h: Record<string, string>, s = 200) => new Response(null, { status: s, headers: h });
+    expect(pauseMs(a({ "x-sentry-rate-limits": "30:transaction:key, 90:error;default:org" }), 0)).toBe(90_000);
+    expect(pauseMs(a({ "x-sentry-rate-limits": "30:transaction:key" }), 0)).toBe(0);
+    expect(pauseMs(a({ "x-sentry-rate-limits": "45::org" }), 0)).toBe(45_000);
+    expect(pauseMs(a({ "retry-after": new Date(120_000).toUTCString() }, 429), 0)).toBe(120_000);
+    expect(pauseMs(a({}, 429), 0)).toBe(60_000);
+    expect(pauseMs(a({}, 200), 0)).toBe(0);
+  });
+});
+
+describe("Nachträge Gegenprobe", () => {
+  it("die DSN im Envelope ist die neu gebaute, nicht der übergebene Text", async () => {
+    await melder({ dsn: { server: `  ${basis.replace("http:", "HTTP:")}/1  ` } }).melde({ route: "/intern/fehlerprobe", code: "unbehandelt" }).fertig;
+    expect(zeilen(empfangen[0].body)[0].dsn).toBe(`${basis}/1`);
+  });
+
+  it("eine spätere Antwort ohne Grenze verkürzt eine laufende Pause nicht", async () => {
+    antwortFuer = () => (empfangen.length === 1 ? { status: 429, headers: { "retry-after": "600" } } : { status: 200, verzoegerung: 50 });
+    const m = melder();
+    const a = m.melde({ route: "/intern/fehlerprobe", code: "unbehandelt" }).fertig;
+    const b = m.melde({ route: "/api/klienten/[id]", code: "unbehandelt" }).fertig;
+    expect((await Promise.all([a, b])).sort()).toEqual(["fehler", "gesendet"]);
+    expect(await m.melde({ route: "/intern/fehlerprobe", code: "antwort_5xx" }).fertig).toBe("verworfen");
+  });
+
+  it("auch eine werfende Uhr im Antwortpfad lässt fertig nicht ablehnen", async () => {
+    let aufrufe = 0;
+    const m = melder({ jetzt: () => { if (++aufrufe > 4) throw new Error("uhr"); return 0; } });
+    expect(await m.melde({ route: "/intern/fehlerprobe", code: "unbehandelt" }).fertig).toBe("fehler");
   });
 });
