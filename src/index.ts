@@ -44,6 +44,8 @@ const STUNDE = 3_600_000;
 const GRENZE_MINUTE = { gesamt: 30, browser: 10 };
 const GRENZE_OFFEN = 10;
 const GRENZE_KOERBE = 500;
+/** Je Korb höchstens eine Zusammenfassung in diesem Abstand; ein Dauersturm erzeugt so ≤ 6 Ereignisse je Stunde. */
+const ABSTAND_ZUSAMMENFASSUNG = 10 * MINUTE;
 const ZEITLIMIT_MS = 2_000;
 const PAUSE_STANDARD_MS = 60_000;
 
@@ -152,7 +154,19 @@ interface Korb extends Felder {
   anzahl: number;
 }
 
-export function erstelleMelder(e: Einstellungen) {
+export type Melder = ReturnType<typeof baueMelder>;
+
+/** Kann die Einrichtung nicht gelingen, gibt es einen stummen Melder statt einer Ausnahme in der App. */
+export function erstelleMelder(e: Einstellungen): Melder {
+  try {
+    return baueMelder(e);
+  } catch {
+    const fertig = (): Promise<Ergebnis> => Promise.resolve("verworfen");
+    return { melde: () => ({ diagnoseId: randomUUID().replace(/-/g, ""), fertig: fertig() }), spuele: async () => {}, fasseZusammen: () => [], stoppe: () => {} };
+  }
+}
+
+function baueMelder(e: Einstellungen) {
   const p = e.pruefer ?? pruefer;
   const jetzt = e.jetzt ?? Date.now;
   const holen = e.fetch ?? fetch;
@@ -173,6 +187,7 @@ export function erstelleMelder(e: Einstellungen) {
   };
 
   const zuletzt = new Map<string, number>();
+  const zuletztZusammengefasst = new Map<string, number>();
   /** Nicht einzeln zugestellte Vorkommen je (Quelle, Route, Code, Stunde des Vorkommens). */
   const koerbe = new Map<string, Korb>();
   const minute = { beginn: -Infinity, gesamt: 0, browser: 0 };
@@ -180,7 +195,8 @@ export function erstelleMelder(e: Einstellungen) {
   const offen: Record<Quelle, Set<Promise<Ergebnis>>> = { server: new Set(), browser: new Set() };
 
   const neueId = () => randomUUID().replace(/-/g, "");
-  const schluessel = (f: Felder) => `${f.quelle}|${f.route}|${f.code}|${f.status ?? ""}`;
+  /** Ohne Status: 500 und 503 auf derselben Route sind dieselbe Störung und sollen zusammen eine Häufung ergeben. */
+  const schluessel = (f: Felder) => `${f.quelle}|${f.route}|${f.code}`;
 
   function inKorb(f: Felder, stunde: number, anzahl: number) {
     const k = `${schluessel(f)}|${stunde}`;
@@ -299,18 +315,22 @@ export function erstelleMelder(e: Einstellungen) {
     try {
       const t = jetzt();
       const ergebnisse: Promise<Ergebnis>[] = [];
+      for (const [k, z] of zuletztZusammengefasst) if (t - z >= 2 * STUNDE) zuletztZusammengefasst.delete(k);
       for (const [k, korb] of koerbe) {
         if (korb.stunde < Math.floor(t / STUNDE) - 1) {
           koerbe.delete(k);
           protokoll({ modul, route: korb.route, code: korb.code, ergebnis: "verworfen", grund: "korb_verfallen", anzahl: String(korb.anzahl) });
           continue;
         }
+        if (t - (zuletztZusammengefasst.get(k) ?? -Infinity) < ABSTAND_ZUSAMMENFASSUNG) continue;
         if (!sendbar(korb.quelle) || !budget(korb.quelle, t)) continue;
-        koerbe.delete(k);
         const { stunde, anzahl, ...f } = korb;
         const zusatz = { wiederholt: stufe(anzahl), ...(anzahl >= 10 ? { haeufungStunde: stunde } : {}) };
+        const fertig = sende(f, neueId(), zusatz);
+        koerbe.delete(k);
+        zuletztZusammengefasst.set(k, t);
         ergebnisse.push(
-          sende(f, neueId(), zusatz).then((r) => {
+          fertig.then((r) => {
             if (r !== "gesendet") inKorb(f, stunde, anzahl);
             return r;
           }),
@@ -340,5 +360,3 @@ export function erstelleMelder(e: Einstellungen) {
 
   return { melde, spuele, fasseZusammen, stoppe: () => clearInterval(takt) };
 }
-
-export type Melder = ReturnType<typeof erstelleMelder>;

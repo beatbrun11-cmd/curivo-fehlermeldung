@@ -369,3 +369,52 @@ describe("Nachträge Gegenprobe", () => {
     expect(await m.melde({ route: "/intern/fehlerprobe", code: "unbehandelt" }).fertig).toBe("fehler");
   });
 });
+
+describe("Nachträge Runde 2", () => {
+  it("500 und 503 auf derselben Route ergeben zusammen eine Häufung", async () => {
+    let t = 7_200_000;
+    const m = melder({ jetzt: () => t });
+    for (let i = 0; i < 12; i++, t += 100) m.melde({ route: "/api/klienten/[id]", code: "antwort_5xx", status: i % 2 ? 503 : 500 });
+    await Promise.all(m.fasseZusammen());
+    expect(empfangen).toHaveLength(2);
+    expect(zeilen(empfangen[1].body)[2].fingerprint[3]).toBe("haeufung");
+  });
+
+  it("je Korb höchstens eine Zusammenfassung in zehn Minuten, die Zählung geht nicht verloren", async () => {
+    let t = Date.UTC(2026, 10, 2, 14, 0);
+    const m = melder({ jetzt: () => t });
+    const welle = async (n: number) => { for (let i = 0; i < n; i++, t += 10) m.melde({ route: "/api/klienten/[id]", code: "unbehandelt" }); };
+    await welle(15);
+    await Promise.all(m.fasseZusammen());
+    await welle(15);
+    t += 60_000;
+    expect(m.fasseZusammen()).toHaveLength(0);
+    t += 9 * 60_000;
+    await Promise.all(m.fasseZusammen());
+    const zusammen = empfangen.slice(1).map((x) => zeilen(x.body)[2]);
+    expect(zusammen).toHaveLength(2);
+    expect(zusammen.map((z) => z.tags.wiederholt)).toEqual(["10-99", "10-99"]);
+  });
+
+  it("eine werfende Einstellung ergibt einen stummen Melder, keine Ausnahme", async () => {
+    const e = { modul: "log", dsn: { server: `${basis}/1` }, environment: "produktion", routen: ROUTEN, testmodus: true, aus: () => false };
+    Object.defineProperty(e, "release", { get() { throw new Error("getter"); } });
+    const m = erstelleMelder(e as never);
+    expect(await m.melde({ route: "/intern/fehlerprobe", code: "unbehandelt" }).fertig).toBe("verworfen");
+    expect(empfangen).toHaveLength(0);
+  });
+
+  it("scheitert eine Zusammenfassung schon beim Bauen, bleibt der Korb", async () => {
+    let t = 7_200_000;
+    let bisFehler = Infinity;
+    // Der dritte Uhraufruf in fasseZusammen ist der Zeitstempel im Ereignis, also mitten im Bau.
+    const m = melder({ jetzt: () => { if (--bisFehler === 0) throw new Error("uhr"); return t; } });
+    for (let i = 0; i < 12; i++, t += 10) m.melde({ route: "/api/klienten/[id]", code: "unbehandelt" });
+    await new Promise((r) => setTimeout(r, 20));
+    bisFehler = 3;
+    expect(m.fasseZusammen()).toHaveLength(0);
+    expect(bisFehler).toBe(0);
+    await Promise.all(m.fasseZusammen());
+    expect(zeilen(empfangen.at(-1)!.body)[2].tags.wiederholt).toBe("10-99");
+  });
+});
