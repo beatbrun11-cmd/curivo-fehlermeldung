@@ -295,7 +295,14 @@ function baueMelder(e: Einstellungen) {
       }
       zuletzt.set(k, t);
       if (zuletzt.size > GRENZE_KOERBE) for (const [s, z] of zuletzt) if (t - z >= MINUTE) zuletzt.delete(s);
-      const fertig = sende(f, diagnoseId).then((r) => {
+      let gesendet: Promise<Ergebnis>;
+      try {
+        gesendet = sende(f, diagnoseId);
+      } catch {
+        inKorb(f, stunde, 1);
+        return { diagnoseId, fertig: Promise.resolve("fehler") };
+      }
+      const fertig = gesendet.then((r) => {
         if (r !== "gesendet") inKorb(f, stunde, 1);
         return r;
       });

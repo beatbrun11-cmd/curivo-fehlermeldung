@@ -299,10 +299,12 @@ describe("Zusammenfassungen", () => {
     const m = melder({ jetzt: () => t });
     for (let i = 0; i < 12; i++, t += 100) m.melde({ route: "/api/klienten/[id]", code: "unbehandelt" });
     expect(await Promise.all(m.fasseZusammen())).toEqual(["fehler"]);
+    const vorher = empfangen.length;
     status = 200;
-    t += 60_000;
-    await Promise.all(m.fasseZusammen());
-    const z = zeilen(empfangen.at(-1)!.body)[2];
+    t += 10 * 60_000;
+    expect(await Promise.all(m.fasseZusammen())).toEqual(["gesendet"]);
+    expect(empfangen.length).toBe(vorher + 1);
+    const z = empfangen.slice(vorher).map((x) => zeilen(x.body)[2]).find((x) => x.fingerprint[3] === "haeufung");
     expect(z.fingerprint[3]).toBe("haeufung");
     expect(z.tags.wiederholt).toBe("10-99");
   });
@@ -416,5 +418,20 @@ describe("Nachträge Runde 2", () => {
     expect(bisFehler).toBe(0);
     await Promise.all(m.fasseZusammen());
     expect(zeilen(empfangen.at(-1)!.body)[2].tags.wiederholt).toBe("10-99");
+  });
+});
+
+describe("Nachträge Runde 3", () => {
+  it("scheitert ein gewöhnliches Ereignis schon beim Bauen, landet es im Korb", async () => {
+    let t = 7_200_000;
+    let bisFehler = Infinity;
+    const m = melder({ jetzt: () => { if (--bisFehler === 0) throw new Error("uhr"); return t; } });
+    // melde: Zeitpunkt, sendbar; sende: Zeitstempel → der dritte Aufruf wirft mitten im Bau.
+    bisFehler = 3;
+    expect(await m.melde({ route: "/api/klienten/[id]", code: "unbehandelt" }).fertig).toBe("fehler");
+    t += 60_000;
+    await Promise.all(m.fasseZusammen());
+    expect(empfangen).toHaveLength(1);
+    expect(zeilen(empfangen[0].body)[2].tags.wiederholt).toBe("1-9");
   });
 });
